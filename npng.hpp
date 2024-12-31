@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,94 @@ enum class Error
 	INVALID_FILTER_TYPE
 };
 
+struct Node
+{
+	unsigned short data = 0;
+	Node *left = nullptr;
+	Node *right = nullptr;
+	bool is_code = false;
+};
+
+class ZStream
+{
+	Error err = Error::NONE;
+	// Decompressed data
+	vector<unsigned char> data;
+	// Compressed data
+	vector<unsigned char> stream;
+	unsigned int cur_byte = 0;
+	unsigned char cur_bit = 0;
+	bool done = false;
+
+	constexpr static unsigned char code_lengths_alphabet[] = {16, 17, 18, 0, 8,  7, 9,  6, 10, 5,
+	                                                          11, 4,  12, 3, 13, 2, 14, 1, 15};
+
+	constexpr static unsigned short len_base_alphabet[] = {3,  4,  5,  6,   7,   8,   9,   10,  11, 13,
+	                                                       15, 17, 19, 23,  27,  31,  35,  43,  51, 59,
+	                                                       67, 83, 99, 115, 131, 163, 195, 227, 258};
+
+	constexpr static unsigned char len_extra_bits[] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+	                                                   2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+
+	constexpr static unsigned int dist_base_alphabet[] = {
+		1,   2,   3,   4,   5,   7,    9,    13,   17,   25,   33,   49,   65,    97,    129,
+		193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+
+	constexpr static unsigned char dist_extra_bits[] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
+	                                                    6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+	void process_chunk();
+	vector<unsigned short> scan_tree(unsigned short num_codes, Node *code_tree);
+	unsigned short scan_code(const Node *tree);
+	void decompress_block(const Node *len_tree, const Node *dist_tree);
+	void inc_bit()
+	{
+		cur_bit++;
+		cur_byte += cur_bit / 8;
+		cur_bit %= 8;
+	}
+	void inc_bits(unsigned char num)
+	{
+		unsigned char bytes = num / 8;
+		unsigned char bits = num % 8;
+
+		cur_byte += bytes;
+		cur_bit += bits;
+
+		cur_byte += cur_bit / 8;
+		cur_bit %= 8;
+	}
+
+	// Limit is however many bits are in an int on this architecture. multibyte numbers are interpreted in LSB
+	unsigned int consume_bits(unsigned char num_bits)
+	{
+		if (num_bits > (sizeof(int) * 8))
+			return 0;
+
+		unsigned int res = 0;
+		for (int i = 0; i < num_bits; i++)
+		{
+			res += ((stream[cur_byte] >> cur_bit) & 0x1) << i;
+			inc_bit();
+		}
+		return res;
+	}
+	vector<unsigned short> inflate_tree(vector<unsigned short> lens, unsigned char max_len);
+	Node *construct_tree(const unsigned char *alphabet, vector<unsigned short> codes, vector<unsigned short> code_lens);
+	void destroy_tree(Node *tree);
+
+  public:
+	ZStream(vector<unsigned char> &stream);
+	Error get_error()
+	{
+		return err;
+	}
+	vector<unsigned char> get_data()
+	{
+		return data;
+	}
+};
+
 class Image
 {
 	vector<unsigned char> raw_data;
@@ -44,7 +133,7 @@ class Image
 	unsigned char bit_depth, color_type, compression_method, filter_method, interlace_method, components;
 
 	void process_chunk();
-	char paeth_predictor(unsigned char a, unsigned char b, unsigned char c);
+	unsigned char paeth_predictor(unsigned char a, unsigned char b, unsigned char c);
 
   public:
 	Image(string filePath);
@@ -71,7 +160,370 @@ class Image
 	unsigned int get_u_int(int idx);
 };
 
+#define NPNG_IMPLEMENTATION
 #ifdef NPNG_IMPLEMENTATION
+void print_tree(const Node *root)
+{
+	if (!root)
+		return;
+
+	if (!root->is_code)
+	{
+		print_tree(root->left);
+		print_tree(root->right);
+		return;
+	}
+
+	cout << "CODE: " << root->data << endl;
+}
+
+ZStream::ZStream(vector<unsigned char> &stream)
+{
+	this->stream = stream;
+
+	// first six bytes are header
+
+	// compression method and info (first byte)
+	unsigned char compression_method = stream[0] & 0x0F;
+	unsigned char compression_info = (stream[0] & 0xF0) >> 4;
+
+	// we only support compression method 8 (DEFLATE)
+	if (compression_method != 8)
+	{
+		err = Error::ZLIB_ERROR;
+		return;
+	}
+
+	// calculate the window size
+	int window_size = 1;
+	for (int i = 0; i < compression_info + 8; i++)
+	{
+		window_size *= 2;
+	}
+
+	// Flags (second byte)
+	unsigned char fdict = (stream[1] & 0x20) >> 5;
+	unsigned char flevel = (stream[1] & 0xC0) >> 6;
+
+	// we dont support preset dictionaries
+	if (fdict == 1)
+	{
+		err = Error::ZLIB_ERROR;
+		return;
+	}
+
+	// make sure our header is valid
+	uint16_t fcheck = (stream[0] << 8) + stream[1];
+	if (fcheck % 31 != 0)
+	{
+		err = Error::ZLIB_ERROR;
+		return;
+	}
+
+	cur_byte += 2;
+
+	process_chunk();
+	//	while (!done)
+	//	{
+	//		process_chunk();
+	//		if (err != Error::NONE)
+	//			return;
+	//	}
+
+	// TODO: last 4 bytes are ADLER32 checksum
+}
+
+vector<unsigned short> ZStream::inflate_tree(vector<unsigned short> lens, unsigned char max_len)
+{
+	vector<unsigned short> codes(lens.size(), 0);
+
+	vector<unsigned short> len_freqs(max_len + 1, 0);
+	for (int i = 0; i < lens.size(); i++)
+	{
+		len_freqs[lens[i]]++;
+	}
+
+	cout << "FREQS: " << endl;
+	for (int i = 0; i < len_freqs.size(); i++)
+	{
+		cout << i << ": " << len_freqs.at(i) << endl;
+	}
+
+	cout << "FIRST CODES: " << endl;
+	unsigned short current_code = 0;
+	vector<unsigned short> next_code(max_len + 1, 0);
+	len_freqs[0] = 0;
+	for (char i = 1; i <= max_len; i++)
+	{
+		current_code = (current_code + len_freqs[i - 1]) << 1;
+		next_code[i] = current_code;
+		auto t = bitset<15>(next_code[i]);
+		cout << "LEN: " << +i << ", START CODE: " << t << endl;
+	}
+
+	for (int n = 0; n < lens.size(); n++)
+	{
+		unsigned short len = lens[n];
+		if (len != 0)
+		{
+			codes[n] = next_code[len];
+			next_code[len]++;
+		}
+	}
+
+	return codes;
+}
+
+Node *ZStream::construct_tree(const unsigned char *alphabet, vector<unsigned short> codes,
+                              vector<unsigned short> code_lens)
+{
+	Node *root = new Node();
+
+	Node *cur_node = root;
+	for (int i = 0; i < codes.size(); i++)
+	{
+		// Traverse down the tree
+		for (int j = 0; j < code_lens[i]; j++)
+		{
+			int dir = (codes[i] >> (code_lens[i] - j - 1)) & 0x1;
+
+			// 0 is left, 1 is right
+			if (dir == 0)
+			{
+				if (cur_node->left == nullptr)
+				{
+					cur_node->left = new Node();
+					cur_node = cur_node->left;
+					continue;
+				}
+
+				cur_node = cur_node->left;
+			}
+			else
+			{
+				if (cur_node->right == nullptr)
+				{
+					cur_node->right = new Node();
+					cur_node = cur_node->right;
+					continue;
+				}
+
+				cur_node = cur_node->right;
+			}
+		}
+
+		if (code_lens[i] != 0)
+		{
+			if (alphabet)
+			{
+				cur_node->data = alphabet[i];
+			}
+			else
+			{
+				cur_node->data = i;
+			}
+			cur_node->is_code = true;
+		}
+
+		cur_node = root;
+	}
+
+	return root;
+}
+
+void ZStream::destroy_tree(Node *tree)
+{
+	if (tree->left)
+		destroy_tree(tree->left);
+	if (tree->right)
+		destroy_tree(tree->right);
+
+	delete tree;
+}
+
+vector<unsigned short> ZStream::scan_tree(unsigned short num_codes, Node *code_tree)
+{
+	cout << "SCANNING CODES: " << endl;
+	vector<unsigned short> scanned_codes;
+	while (scanned_codes.size() < num_codes)
+	{
+		unsigned short scanned_code = scan_code(code_tree);
+		cout << "SCANNED CODE: " << scanned_code << endl;
+
+		if (scanned_code == 16)
+		{
+			unsigned char repeat = consume_bits(2) + 3;
+
+			for (int i = 0; i < repeat; i++)
+				scanned_codes.push_back(scanned_codes.back());
+		}
+		else if (scanned_code == 17)
+		{
+			unsigned char repeat = consume_bits(3) + 3;
+
+			for (int i = 0; i < repeat; i++)
+				scanned_codes.push_back(0);
+		}
+		else if (scanned_code == 18)
+		{
+			unsigned char repeat = consume_bits(7) + 11;
+
+			for (int i = 0; i < repeat; i++)
+				scanned_codes.push_back(0);
+		}
+		else if (scanned_code < 16)
+		{
+			scanned_codes.push_back(scanned_code);
+		}
+		else
+		{
+			cerr << "ERROR: " << scanned_code << endl;
+		}
+	}
+
+	return scanned_codes;
+}
+
+unsigned short ZStream::scan_code(const Node *tree)
+{
+	bool found_code = false;
+	const Node *cur_node = tree;
+	unsigned short scanned_code;
+	while (!found_code)
+	{
+		if (cur_node->is_code)
+		{
+			scanned_code = cur_node->data;
+			found_code = true;
+		}
+		else
+		{
+			unsigned char dir = consume_bits(1);
+			if (dir == 1)
+				cur_node = cur_node->right;
+			else
+				cur_node = cur_node->left;
+		}
+	}
+	return scanned_code;
+}
+
+void ZStream::decompress_block(const Node *len_tree, const Node *dist_tree)
+{
+	// Loop until end of block code
+	int idx = 0;
+	while (true && idx < 10)
+	{
+		unsigned short scanned_code = scan_code(len_tree);
+		idx++;
+
+		if (scanned_code >= 0 && scanned_code < 256)
+		{
+			data.push_back(scanned_code);
+		}
+		// end of block code
+		else if (scanned_code == 256)
+		{
+			break;
+		}
+		else if (scanned_code <= 285)
+		{
+			auto len = len_base_alphabet[scanned_code - 256] + consume_bits(len_extra_bits[scanned_code - 256]);
+
+			unsigned short scanned_dist_code = scan_code(dist_tree);
+
+			auto dist = dist_base_alphabet[scanned_dist_code] + consume_bits(dist_base_alphabet[scanned_dist_code]);
+
+			cout << "LEN: " << len << "DIST: " << dist << endl;
+
+			// TODO: make sure to copy the data
+		}
+		else
+		{
+			err = Error::ZLIB_ERROR;
+			return;
+		}
+	}
+}
+
+void ZStream::process_chunk()
+{
+	unsigned char bfinal = consume_bits(1);
+	unsigned char btype = consume_bits(2);
+
+	if (bfinal == 1)
+		done = true;
+
+	// 3 is reserved
+	if (btype == 3)
+	{
+		err = Error::ZLIB_ERROR;
+		return;
+	}
+
+	// no compression
+	if (btype == 0)
+	{
+		// skip the remaining bits in the cur byte
+		inc_bits(8 - cur_bit);
+		uint16_t len = 0;
+		len += stream[cur_byte] + (stream[cur_byte + 1] << 8);
+		cur_byte += 2;
+
+		// TODO: implement the rest of this
+	}
+	// fixed huffman
+	else if (btype == 1)
+	{
+	}
+	// we only consume 2 bits so we should never be over btype 3
+	// dynamic huffman (btype 2)
+	else
+	{
+		cout << "BTYPE: " << +btype << endl;
+		uint8_t HLIT = consume_bits(5);
+		uint8_t HDIST = consume_bits(5);
+		uint8_t HCLEN = consume_bits(4);
+
+		vector<unsigned short> code_lens;
+		for (int i = 0; i < HCLEN + 4; i++)
+		{
+			unsigned short cur_len = consume_bits(3);
+			code_lens.push_back(cur_len);
+		}
+
+		auto len_codes = inflate_tree(code_lens, 7);
+		auto len_codes_tree = construct_tree(code_lengths_alphabet, len_codes, code_lens);
+
+		auto scanned_lit_code_lens = scan_tree(HLIT + 257, len_codes_tree);
+		auto scanned_distance_code_lens = scan_tree(HDIST + 1, len_codes_tree);
+
+		auto lit_tree_codes = inflate_tree(scanned_lit_code_lens, 15);
+		auto distance_tree_codes = inflate_tree(scanned_distance_code_lens, 15);
+
+		int idx = 0;
+		for (const auto &i : len_codes)
+		{
+			cout << "alpha: " << +code_lengths_alphabet[idx] << endl;
+			cout << "len: " << code_lens[idx] << endl;
+			auto t = bitset<15>(i);
+			cout << t << endl;
+			cout << "num code: " << i << endl << endl;
+			idx++;
+		}
+
+		auto lit_tree = construct_tree(nullptr, lit_tree_codes, scanned_lit_code_lens);
+		auto distance_tree = construct_tree(nullptr, distance_tree_codes, scanned_distance_code_lens);
+
+		print_tree(lit_tree);
+
+		decompress_block(lit_tree, distance_tree);
+
+		destroy_tree(lit_tree);
+		destroy_tree(distance_tree);
+	}
+}
+
 unsigned int Image::get_u_int(int idx)
 {
 	unsigned int res;
@@ -123,6 +575,8 @@ Image::Image(string filePath)
 		if (err != Error::NONE)
 			return;
 	}
+
+	ZStream zs(compressed_data);
 
 	// Now decompress the compressed data
 	const int buffer_len = 2048;
@@ -236,7 +690,7 @@ Image::Image(string filePath)
 				data[cur_byte_idx] += paeth_predictor(a, b, c);
 				data[cur_byte_idx] %= 256;
 				continue;
-			case 5:
+			default:
 				err = Error::INVALID_FILTER_TYPE;
 				return;
 			}
@@ -244,7 +698,7 @@ Image::Image(string filePath)
 	}
 }
 
-char Image::paeth_predictor(unsigned char a, unsigned char b, unsigned char c)
+unsigned char Image::paeth_predictor(unsigned char a, unsigned char b, unsigned char c)
 {
 	int p = a + b - c;
 	int pa = abs(p - a);
