@@ -2,3 +2,4 @@ main.cpp
 *.png
 *.out
 *.txt
+stb_image_write.h
