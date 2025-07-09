@@ -159,6 +159,7 @@ class Image
 	unsigned int get_u_int(int idx);
 };
 
+// TODO: REMOVE THIS 
 #define NPNG_IMPLEMENTATION
 #ifdef NPNG_IMPLEMENTATION
 ZStream::ZStream(vector<unsigned char> &stream)
